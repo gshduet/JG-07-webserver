@@ -2,9 +2,6 @@
 /*
  * tiny.c - A simple, iterative HTTP/1.0 Web server that uses the
  *     GET method to serve static and dynamic content.
- *
- * Updated 11/2019 droh
- *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
  */
 #include "csapp.h"
 
@@ -41,7 +38,12 @@ int main(int argc, char **argv) {
     Close(connfd); // line:netp:tiny:close
   }
 }
+/* $end tinymain */
 
+/*
+ * doit - handle one HTTP request/response transaction
+ */
+/* $begin doit */
 void doit(int fd) {
   int is_static;
   struct stat sbuf;
