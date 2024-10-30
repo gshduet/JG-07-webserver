@@ -4,6 +4,8 @@
 /* 프록시 서버의 캐시 관련 상수 정의 */
 #define MAX_CACHE_SIZE 1049000  /* 최대 캐시 크기 (약 1MB) */
 #define MAX_OBJECT_SIZE 102400  /* 캐시 가능한 최대 객체 크기 (약 100KB) */
+#define BACKEND_PORT "8000"     /* 백엔드 서버 포트 */
+#define BACKEND_HOST "127.0.0.1" /* 백엔드 서버 호스트 */
 
 /* User-Agent 헤더 문자열 상수 */
 static const char *user_agent_hdr = 
@@ -19,7 +21,7 @@ void send_error(int fd, char *cause, char *err_num, char *short_msg, char *long_
 
 /* 
  * main - 프록시 서버의 시작점
- * 지정된 포트에서 클라이언트의 연결을 대기하고 처리
+ * 80번 포트에서 클라이언트의 연결을 대기하고 처리
  */
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);  /* 디버깅을 위한 표준 출력 버퍼링 비활성화 */
@@ -29,13 +31,9 @@ int main(int argc, char *argv[]) {
     socklen_t client_len;
     struct sockaddr_storage client_addr;
 
-    /* 명령행 인자 검사 */
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
-
-    listen_fd = Open_listenfd(argv[1]);
+    /* 80번 포트로 고정 */
+    listen_fd = Open_listenfd("80");
+    printf("리버스 프록시 서버가 80번 포트에서 시작되었습니다.\n");
 
     while (1) {
         client_len = sizeof(client_addr);
@@ -49,12 +47,12 @@ int main(int argc, char *argv[]) {
 
 /*
  * handle_transaction - 단일 HTTP 트랜잭션 처리
- * 클라이언트의 요청을 받아 서버로 전달하고 응답을 회신
+ * 클라이언트의 요청을 백엔드 서버로 전달하고 응답을 회신
  */
 void handle_transaction(int client_fd) {
     int server_fd;
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
-    char hostname[MAXLINE], path[MAXLINE], port[MAXLINE];
+    char path[MAXLINE];
     rio_t client_rio, server_rio;
 
     printf("\n<<<< 새로운 클라이언트 요청 >>>>\n");
@@ -66,104 +64,53 @@ void handle_transaction(int client_fd) {
 
     printf("클라이언트 요청 라인: %s", buf);
     sscanf(buf, "%s %s %s", method, uri, version);
-    printf("메소드: %s, URI: %s, 버전: %s\n", method, uri, version);
-
-    /* 지원하는 메소드 검사 */
-    if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0) {
-        send_error(client_fd, method, "501", "지원하지 않는 요청",
-                   "프록시가 지원하지 않는 메소드입니다");
-        return;
+    
+    /* URI에서 경로만 추출 */
+    char *path_start = strchr(uri, '/');
+    if (!path_start) {
+        strcpy(path, "/");
+    } else {
+        strcpy(path, path_start);
     }
 
-    /* URI 파싱 */
-    if (parse_uri(uri, hostname, path, port) < 0) {
-        send_error(client_fd, uri, "400", "잘못된 요청",
-                   "프록시가 URI를 파싱할 수 없습니다");
-        return;
-    }
-
-    /* 서버 연결 */
-    printf("서버 연결 시도: %s:%s\n", hostname, port);
-    server_fd = Open_clientfd(hostname, port);
+    /* 백엔드 서버 연결 */
+    printf("백엔드 서버 연결 시도: %s:%s\n", BACKEND_HOST, BACKEND_PORT);
+    server_fd = Open_clientfd(BACKEND_HOST, BACKEND_PORT);
     if (server_fd < 0) {
-        send_error(client_fd, hostname, "404", "찾을 수 없음",
-                   "서버에 연결할 수 없습니다");
+        send_error(client_fd, BACKEND_HOST, "502", "Bad Gateway",
+                   "백엔드 서버에 연결할 수 없습니다");
         return;
     }
 
     /* 서버와의 통신 처리 */
     Rio_readinitb(&server_rio, server_fd);
-    send_request(server_fd, method, path, hostname);
+    
+    /* 백엔드 서버로 요청 전송 */
+    sprintf(buf, "%s %s HTTP/1.0\r\n", method, path);
+    Rio_writen(server_fd, buf, strlen(buf));
+    
+    /* 원본 요청 헤더 전달 */
+    char header_buf[MAXLINE];
+    ssize_t n;
+    while ((n = Rio_readlineb(&client_rio, header_buf, MAXLINE)) > 0) {
+        if (strcmp(header_buf, "\r\n") == 0) {
+            Rio_writen(server_fd, "\r\n", 2);
+            break;
+        }
+        
+        /* Host 헤더 수정 */
+        if (strncasecmp(header_buf, "Host:", 5) == 0) {
+            sprintf(buf, "Host: %s:%s\r\n", BACKEND_HOST, BACKEND_PORT);
+            Rio_writen(server_fd, buf, strlen(buf));
+        } else {
+            Rio_writen(server_fd, header_buf, n);
+        }
+    }
+
+    /* 응답 전달 */
     forward_response(server_fd, client_fd);
 
     Close(server_fd);
-}
-
-/*
- * parse_uri - URI를 호스트명, 경로, 포트로 파싱
- * 반환값: 성공시 0, 실패시 -1
- */
-int parse_uri(char *uri, char *hostname, char *path, char *port) {
-    strcpy(port, "80");  /* 기본 포트 설정 */
-
-    char *host_start = strstr(uri, "://") ? strstr(uri, "://") + 3 : uri;
-
-    /* 경로 파싱 */
-    char *path_start = strchr(host_start, '/');
-    if (path_start) {
-        strcpy(path, path_start);
-        *path_start = '\0';
-    } else {
-        strcpy(path, "/");
-    }
-
-    /* 포트 번호 파싱 */
-    char *port_start = strchr(host_start, ':');
-    if (port_start) {
-        *port_start = '\0';
-        strcpy(port, port_start + 1);
-    }
-
-    /* 로컬 통신 최적화 */
-    if (strcmp(hostname, "13.125.78.231") == 0) {
-        strcpy(hostname, "127.0.0.1");
-    } else {
-        strcpy(hostname, host_start);
-    }
-
-    return 0;
-}
-
-/*
- * send_request - 서버에 HTTP 요청 전송
- * 필요한 모든 HTTP 헤더를 포함하여 요청
- */
-void send_request(int server_fd, char *method, char *path, char *hostname) {
-    char buf[MAXLINE];
-
-    printf("\n<<<< 서버로 프록시 요청 전송 >>>>\n");
-
-    /* 요청 라인 전송 */
-    sprintf(buf, "%s %s HTTP/1.0\r\n", method, path);
-    printf("요청 라인: %s", buf);
-    Rio_writen(server_fd, buf, strlen(buf));
-
-    /* 헤더 전송 */
-    sprintf(buf, "Host: %s\r\n", hostname);
-    printf("<헤더>\nHost: %s", buf);
-    Rio_writen(server_fd, buf, strlen(buf));
-
-    sprintf(buf, "%s", user_agent_hdr);
-    printf("User-Agent: %s", buf);
-    Rio_writen(server_fd, buf, strlen(buf));
-
-    sprintf(buf, "Connection: close\r\n");
-    printf("Connection: %s", buf);
-    Rio_writen(server_fd, buf, strlen(buf));
-
-    sprintf(buf, "Proxy-Connection: close\r\n\r\n");
-    printf("Proxy-Connection: %s", buf);
-    Rio_writen(server_fd, buf, strlen(buf));
 }
 
 /*
@@ -174,28 +121,18 @@ void forward_response(int server_fd, int client_fd) {
     char buf[MAXLINE];
     rio_t rio;
     ssize_t n;
-    int total_bytes = 0, header_end = 0;
+    int total_bytes = 0;
 
-    printf("\n<<<< 서버 응답 수신 >>>>\n");
+    printf("\n<<<< 백엔드 서버 응답 수신 및 전달 >>>>\n");
     Rio_readinitb(&rio, server_fd);
 
-    /* 헤더 전달 */
-    while ((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
-        printf("수신: %s", buf);
-        Rio_writen(client_fd, buf, n);
-        total_bytes += n;
-
-        if (strcmp(buf, "\r\n") == 0) {
-            header_end = 1;
-            break;
-        }
-    }
-
-    /* 본문 전달 */
+    /* 응답 전체 전달 */
     while ((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
         Rio_writen(client_fd, buf, n);
         total_bytes += n;
     }
+
+    printf("전송된 총 바이트: %d\n", total_bytes);
     printf("<<<< 응답 전송 완료 >>>>\r\n");
 }
 
@@ -211,7 +148,7 @@ void send_error(int fd, char *cause, char *err_num, char *short_msg, char *long_
     sprintf(body, "%s<body bgcolor=""ffffff"">\r\n", body);
     sprintf(body, "%s%s: %s\r\n", body, err_num, short_msg);
     sprintf(body, "%s<p>%s: %s\r\n", body, long_msg, cause);
-    sprintf(body, "%s<hr><em>프록시 웹 서버</em>\r\n", body);
+    sprintf(body, "%s<hr><em>리버스 프록시 웹 서버</em>\r\n", body);
 
     /* 응답 헤더 전송 */
     sprintf(buf, "HTTP/1.0 %s %s\r\n", err_num, short_msg);
