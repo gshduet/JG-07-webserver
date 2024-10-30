@@ -14,8 +14,9 @@ static const char *user_agent_hdr =
 void handle_transaction(int fd);
 void send_request(int server_fd, char *method, char *path, char *hostname);
 void forward_response(int server_fd, int client_fd);
-int parse_uri(char *uri, char *hostname, char *path, char *port);
 void send_error(int fd, char *cause, char *err_num, char *short_msg, char *long_msg);
+void *thread(void *vargp);
+int parse_uri(char *uri, char *hostname, char *path, char *port);
 
 /* 
  * main - 프록시 서버의 시작점
@@ -24,27 +25,39 @@ void send_error(int fd, char *cause, char *err_num, char *short_msg, char *long_
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);  /* 디버깅을 위한 표준 출력 버퍼링 비활성화 */
 
-    int listen_fd, conn_fd;
+    int listen_fd, conn_fd, *conn_fdp;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t client_len;
     struct sockaddr_storage client_addr;
+    pthread_t tid;
 
     /* 명령행 인자 검사 */
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(1);
+        exit(0);
     }
 
     listen_fd = Open_listenfd(argv[1]);
 
     while (1) {
         client_len = sizeof(client_addr);
-        conn_fd = Accept(listen_fd, (SA *)&client_addr, &client_len);
-        Getnameinfo((SA *)&client_addr, client_len, hostname, MAXLINE, port, MAXLINE, 0);
-        printf("클라이언트 연결 수락: (%s, %s)\n", hostname, port);
-        handle_transaction(conn_fd);
-        Close(conn_fd);
+        conn_fdp = Malloc(sizeof(int));
+        *conn_fdp = Accept(listen_fd, (SA *) &client_addr, &client_len);
+        Pthread_create(&tid, NULL, thread, conn_fdp);
     }
+}
+
+/*
+ 스레드 루틴
+*/
+void *thread(void *vargp) {
+    int conn_fd = *((int *)vargp);
+    Pthread_detach(pthread_self());
+    Free(vargp);
+    handle_transaction(conn_fd);
+    Close(conn_fd);
+
+    return NULL;
 }
 
 /*
